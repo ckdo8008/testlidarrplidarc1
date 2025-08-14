@@ -6,16 +6,26 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:usb_serial/usb_serial.dart';
 
+/// 공개: 원시 프레임(객체 생성 없이)
+class RplidarFrame {
+  final Float32List angles; // degrees
+  final Float32List dists;  // mm
+  final Uint8List quals;    // 0..255
+  const RplidarFrame(this.angles, this.dists, this.quals);
+  int get length => angles.length;
+}
+
+/// (레거시 호환이 필요하면 유지)
 class RplidarPoint {
   final double angleDeg;   // 0..360
   final double distanceMm; // mm
   final int quality;       // 0..255
-  final bool startFlag;    // 회전 시작(S=1) - 프레임 결과에선 의미 없음
+  final bool startFlag;    // 의미 없음(프레임 결과)
   RplidarPoint(this.angleDeg, this.distanceMm, this.quality, this.startFlag);
 }
 
 class RplidarC1 {
-  static const int baud = 460800; // C1 권장 보드레이트
+  static const int baud = 460800;
   static const List<int> _CMD_SCAN = [0xA5, 0x20];
   static const List<int> _CMD_STOP = [0xA5, 0x25];
   static const List<int> _CMD_GET_INFO = [0xA5, 0x50];
@@ -24,12 +34,13 @@ class RplidarC1 {
   UsbPort? _port;
   StreamSubscription<Uint8List>? _rxSub;
 
-  // 메인 API 스트림
-  // final _pointCtrl = StreamController<RplidarPoint>.broadcast();
-  // Stream<RplidarPoint> get points => _pointCtrl.stream;
+  // (옵션) 포인트 스트림은 부하가 큽니다. 기본은 사용 안 함.
+  final _pointCtrl = StreamController<RplidarPoint>.broadcast();
+  Stream<RplidarPoint> get points => _pointCtrl.stream;
 
-  final _frameCtrl = StreamController<List<RplidarPoint>>.broadcast();
-  Stream<List<RplidarPoint>> get frames => _frameCtrl.stream;
+  // 권장: 프레임(원시 배열) 스트림
+  final _frameCtrl = StreamController<RplidarFrame>.broadcast();
+  Stream<RplidarFrame> get framesRaw => _frameCtrl.stream;
 
   // Parser isolate
   Isolate? _parserIso;
@@ -67,9 +78,12 @@ class RplidarC1 {
     // 파서 Isolate 기동
     await _spawnParserIsolate();
 
-    // USB 수신 → 파서로 바로 전달 (메인에서 파싱/보정 없음)
+    // USB 수신 → 파서로 TransferableTypedData로 전달(복사 최소화)
     _rxSub = _port!.inputStream!.listen(
-          (chunk) => _toParser?.send(_Msg.chunk(chunk)),
+          (chunk) {
+        final ttd = TransferableTypedData.fromList([chunk]);
+        _toParser?.send(_Msg.chunkTtd(ttd));
+      },
       onError: (e, st) => debugPrint('RPLIDAR RX error: $e'),
       cancelOnError: false,
     );
@@ -89,7 +103,7 @@ class RplidarC1 {
     _parserIso?.kill(priority: Isolate.immediate);
     _parserIso = null;
 
-    // await _pointCtrl.close();
+    await _pointCtrl.close();
     await _frameCtrl.close();
   }
 
@@ -121,7 +135,7 @@ class RplidarC1 {
 
   // ──────────────────────────────────────────────
   // Isolate wiring
-  // ──────────────────────────────────────────────
+  // ─────────────────────────────────────────────-
   Future<void> _spawnParserIsolate() async {
     final fromParser = ReceivePort();
     _parserIso = await Isolate.spawn<_IsoBoot>(
@@ -130,36 +144,26 @@ class RplidarC1 {
       debugName: 'rplidar_parser',
     );
 
-    // 첫 메시지는 파서의 수신용 SendPort
     _fromParserSub = fromParser.listen((msg) {
       if (msg is SendPort) {
         _toParser = msg;
         return;
       }
       if (msg is _FrameMsg) {
-        // 프레임 수신: 각도/거리/품질로 RplidarPoint 리스트 구성
-        final n = msg.len;
-        final frame = List<RplidarPoint>.generate(
-          n,
-              (i) => RplidarPoint(
-            msg.angles[i].toDouble(),
-            msg.dists[i].toDouble(),
-            msg.quals[i],
-            false,
-          ),
-          growable: false,
-        );
-        // 프레임 스트림 발행
-        _frameCtrl.add(frame);
+        // ★ 원시 배열 그대로 UI로 전달(객체 생성 제거)
+        _frameCtrl.add(RplidarFrame(msg.angles, msg.dists, msg.quals));
 
-        // // 호환성: 기존 points 스트림에도 발행(옵션)
-        // // 프레임당 수천 이벤트 → 부담되면 주석 처리 권장
-        // for (final p in frame) {
-        //   _pointCtrl.add(p);
+        // (선택) 레거시 포인트 이벤트도 내보내려면 아래 주석 해제 (부하 큼)
+        // for (int i = 0; i < msg.angles.length; i++) {
+        //   _pointCtrl.add(RplidarPoint(
+        //     msg.angles[i].toDouble(),
+        //     msg.dists[i].toDouble(),
+        //     msg.quals[i],
+        //     false,
+        //   ));
         // }
         return;
       }
-      // 기타/무시
     });
   }
 }
@@ -174,11 +178,13 @@ class _IsoBoot {
 
 class _Msg {
   final int kind; // 0=chunk,1=reset,2=close
+  final TransferableTypedData? ttd;
   final Uint8List? bytes;
-  const _Msg._(this.kind, [this.bytes]);
+  const _Msg._(this.kind, {this.ttd, this.bytes});
   const _Msg.reset() : this._(1);
   const _Msg.close() : this._(2);
-  static _Msg chunk(Uint8List c) => _Msg._(0, c);
+  static _Msg chunk(Uint8List c) => _Msg._(0, bytes: c);
+  static _Msg chunkTtd(TransferableTypedData t) => _Msg._(0, ttd: t);
 }
 
 class _FrameMsg {
@@ -190,14 +196,14 @@ class _FrameMsg {
 }
 
 /// ──────────────────────────────────────────────
-/// Parser Isolate entry
+/// Parser Isolate
 /// ─────────────────────────────────────────────-
 void _parserMain(_IsoBoot boot) {
   final toMain = boot.toMain;
   final fromMain = ReceivePort();
   toMain.send(fromMain.sendPort);
 
-  // ── 링 버퍼
+  // 링 버퍼
   Uint8List bb = Uint8List(8192);
   int r = 0, w = 0;
   void ensureCap(int need) {
@@ -211,15 +217,15 @@ void _parserMain(_IsoBoot boot) {
     bb = nb;
   }
 
-  // 상태
   bool descriptorSkipped = false;
   bool seenStart = false;
   final curFrame = <_Pt>[];
 
-  // 파라미터
   const int maxRangeMm = 12000;
 
-  // 보정: SDK ascendScanData_ 요지 (정렬 생략)
+  // (옵션) 출력 디메이트: 1이면 전체, 2면 절반, 3이면 1/3…
+  const int DECIMATE = 2;
+
   void finalizeAndSendFrame() {
     final n = curFrame.length;
     if (n == 0) return;
@@ -238,8 +244,7 @@ void _parserMain(_IsoBoot boot) {
       }
     }
     if (i == n) {
-      // 전부 0 → 그냥 버리거나 보낼 수 있음. 여기선 보냄.
-      _emitFrame(curFrame, toMain, maxRangeMm);
+      _emitFrame(curFrame, toMain, maxRangeMm, decimate: DECIMATE);
       return;
     }
 
@@ -266,8 +271,7 @@ void _parserMain(_IsoBoot boot) {
       }
     }
 
-    // 정렬 생략
-    _emitFrame(curFrame, toMain, maxRangeMm);
+    _emitFrame(curFrame, toMain, maxRangeMm, decimate: DECIMATE);
   }
 
   void reset() {
@@ -287,8 +291,10 @@ void _parserMain(_IsoBoot boot) {
         fromMain.close();
         return;
       case 0: // chunk
-        final chunk = raw.bytes!;
-        // append
+        final Uint8List chunk = raw.ttd != null
+            ? raw.ttd!.materialize().asUint8List()
+            : (raw.bytes ?? Uint8List(0));
+
         ensureCap(w + chunk.length);
         bb.setRange(w, w + chunk.length, chunk);
         w += chunk.length;
@@ -307,10 +313,10 @@ void _parserMain(_IsoBoot boot) {
         while (i + 5 <= w) {
           final b0 = bb[i], b1 = bb[i + 1], b2 = bb[i + 2], b3 = bb[i + 3], b4 = bb[i + 4];
 
-          final s    =  (b0 & 0x01);
-          final nS   = (b0 >> 1) & 0x01;
-          final okS  = ((s ^ nS) == 1);
-          final cOk  = (b1 & 0x01) != 0;
+          final s   = (b0 & 0x01);
+          final nS  = (b0 >> 1) & 0x01;
+          final okS = ((s ^ nS) == 1);
+          final cOk = (b1 & 0x01) != 0;
           if (!(okS && cOk)) { i += 1; continue; }
 
           final angleQ6  = ((b1 >> 1) | (b2 << 7)) & 0x7FFF;
@@ -330,7 +336,6 @@ void _parserMain(_IsoBoot boot) {
           i += 5;
         }
 
-        // read window만 이동
         r = i;
         // 압축(드물게)
         if (r > 4096 && (w - r) < (bb.length >> 1)) {
@@ -344,7 +349,7 @@ void _parserMain(_IsoBoot boot) {
   });
 }
 
-// 내부 포인트 (isolate 내부 전용)
+// 내부 포인트 (isolate 전용)
 class _Pt {
   final double angleDeg;
   final double distMm;
@@ -359,22 +364,32 @@ double _wrap360(double a) {
   return x;
 }
 
-void _emitFrame(List<_Pt> src, SendPort toMain, int maxRangeMm) {
-  // 간단 필터: 0 < d < 12 m 만 유지 (UI에서도 필터하므로 중복 가능)
-  final filtered = src.where((p) => p.distMm > 0 && p.distMm < maxRangeMm);
+void _emitFrame(List<_Pt> src, SendPort toMain, int maxRangeMm, {int decimate = 1}) {
+  // 필터 + (옵션) 디메이트
+  final n0 = src.length;
+  if (n0 == 0) return;
 
-  // TypedData로 패킹 (Isolate 간 전송 효율 ↑)
-  final tmp = filtered.toList(growable: false);
-  final n = tmp.length;
-  final angles = Float32List(n);
-  final dists  = Float32List(n);
-  final quals  = Uint8List(n);
+  // 대략적 upper bound(필터/디메이트 후 실제 n은 이보다 작을 수 있음)
+  final angles = Float32List((n0 / decimate).ceil());
+  final dists  = Float32List((n0 / decimate).ceil());
+  final quals  = Uint8List((n0 / decimate).ceil());
 
-  for (int i = 0; i < n; i++) {
-    final p = tmp[i];
-    angles[i] = p.angleDeg.toDouble();
-    dists[i]  = p.distMm.toDouble();
-    quals[i]  = p.qual;
+  int j = 0;
+  for (int i = 0; i < n0; i += decimate) {
+    final p = src[i];
+    if (p.distMm <= 0 || p.distMm >= maxRangeMm) continue;
+    angles[j] = p.angleDeg.toDouble();
+    dists[j]  = p.distMm.toDouble();
+    quals[j]  = p.qual;
+    j++;
   }
-  toMain.send(_FrameMsg(angles, dists, quals));
+
+  if (j == 0) return;
+
+  // 실제 길이만 잘라서 보냄
+  toMain.send(_FrameMsg(
+    angles.sublist(0, j),
+    dists.sublist(0, j),
+    quals.sublist(0, j),
+  ));
 }
