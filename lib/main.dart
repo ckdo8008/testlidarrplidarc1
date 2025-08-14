@@ -21,14 +21,30 @@ class _LidarPageState extends State<LidarPage> {
 
   // 최신 프레임(원시 배열)
   RplidarFrame? _latest;
-  int _dataVersion = 0;
-  int _paintedVersion = -1;
+  int _dataVersion = 0;       // 프레임이 들어올 때마다 증가
+  int _preparedDataVer = -1;  // 좌표가 준비된 데이터 버전
+  int _paintedVersion = -1;   // 페인터 트리거용
+
+  // 캔버스 사이즈 트래킹
+  Size? _canvasSize;
+  int _sizeStamp = 0;          // 사이즈 변경 시 증가
+  int _preparedSizeStamp = -1; // 좌표가 준비된 사이즈 스탬프
+
+  // 미리 산출된 좌표 버퍼
+  Float32List _coords = Float32List(0);       // 내부 작업용(충분히 큰 버퍼)
+  Float32List _coordsForDraw = Float32List(0); // 그릴 길이만 보이는 view
+  int _coordsLen = 0;                         // 좌표 개수*2
 
   Timer? _repaintTimer;
   bool scanning = false;
 
   // 각도 LUT
-  late final _AngleLut _lut = _AngleLut(0.5);
+  // late final _AngleLut _lut = _AngleLut(0.5);
+  late final _AngleLut _lut = _AngleLut(1.0);
+
+  // 매핑 파라미터
+  static const int _innerMaxMm = 1000;   // 0~1m는 짧은 변 기준
+  static const int _maxMm = 6000;       // 1~6m는 긴 변 기준
 
   @override
   void dispose() {
@@ -49,23 +65,25 @@ class _LidarPageState extends State<LidarPage> {
   Future<void> _start() async {
     _latest = null;
     _dataVersion = 0;
+    _preparedDataVer = -1;
+    _preparedSizeStamp = -1;
     _paintedVersion = -1;
     await sub?.cancel();
 
     // 프레임(원시 배열) 구독: 객체 생성 없음
     sub = lidar.framesRaw.listen((frame) {
-      // (선택) 간단 각도 필터
-      // 여기선 페인터에서 처리하도록 두고, 그대로 저장만
       _latest = frame;
       _dataVersion++;
+      // 사이즈가 이미 있으면 곧바로 좌표 준비(빌드/타이머 기다릴 필요 최소화)
+      if (_canvasSize != null) {
+        _prepareCoordsIfNeeded();
+      }
     });
 
-    // 리페인트 타이머(가벼운 10~20fps 권장)
+    // 리페인트 타이머(저부하 15fps)
     _repaintTimer?.cancel();
     _repaintTimer = Timer.periodic(const Duration(milliseconds: 66), (_) {
-      if (_dataVersion != _paintedVersion) {
-        setState(() => _paintedVersion = _dataVersion);
-      }
+      _prepareCoordsIfNeeded(); // 필요할 때만 setState 발생
     });
 
     await lidar.startScan();
@@ -78,6 +96,75 @@ class _LidarPageState extends State<LidarPage> {
     _repaintTimer?.cancel();
     setState(() => scanning = false);
   }
+
+  // 좌표 사전 산출기 (데이터/사이즈 변경 때만 수행)
+  void _prepareCoordsIfNeeded() {
+    final f = _latest;
+    final sz = _canvasSize;
+    if (f == null || sz == null) return;
+
+    // 변경 없으면 스킵
+    if (_preparedDataVer == _dataVersion && _preparedSizeStamp == _sizeStamp) {
+      return;
+    }
+
+    final centerDx = sz.width  / 2.0;
+    final centerDy = sz.height / 2.0;
+    final longest  = math.max(sz.width, sz.height);
+    final shortest = math.min(sz.width, sz.height);
+    final double rOuter = longest  * 0.45; // 1..12 m
+    final double rInner = shortest * 0.45; // 0..1 m
+
+    // 필요시 버퍼 증설(2 * 점수)
+    final need = f.length * 2;
+    if (_coords.length < need) {
+      _coords = Float32List(need);
+    }
+
+    int j = 0;
+    final angles = f.angles;
+    final dists  = f.dists;
+    final dir = _tmpDir; // 재사용 버퍼
+
+    for (int i = 0; i < f.length; i++) {
+      final d = dists[i].toInt();
+      if (d <= 0 || d > _maxMm) continue;
+
+      double r;
+      if (d <= _innerMaxMm) {
+        final t0 = d / _innerMaxMm;                 // 0..1
+        r = t0 * rInner;
+      } else {
+        final t1 = (d - _innerMaxMm) / (_maxMm - _innerMaxMm); // 0..1
+        r = rInner + t1 * (rOuter - rInner);
+      }
+
+      // 0°=위, CCW, 좌우 반전
+      _lut.dir(angles[i], dir);
+      if (dir[0] == 0.0 && dir[1] == 0.0) continue;
+      _coords[j++] = centerDx + r * dir[0];
+      _coords[j++] = centerDy + r * dir[1];
+    }
+
+    _coordsLen = j;
+
+    // 그릴 길이만 보이는 view를 준비 시점에 미리 만들어둔다(페인트에서 추가 할당 없음)
+    _coordsForDraw = (_coordsLen == 0)
+        ? Float32List(0)
+        : Float32List.view(_coords.buffer, 0, _coordsLen);
+
+    // 준비된 버전/사이즈 기록
+    _preparedDataVer = _dataVersion;
+    _preparedSizeStamp = _sizeStamp;
+
+    // painter 트리거(최소 setState)
+    setState(() {
+      _paintedVersion++;
+    });
+  }
+
+  // 재사용 임시 버퍼(각도->단위벡터)
+  final List<double> _tmpDir = List<double>.filled(2, 0.0, growable: false);
 
   @override
   Widget build(BuildContext context) {
@@ -101,26 +188,46 @@ class _LidarPageState extends State<LidarPage> {
             ],
           ),
           const SizedBox(height: 8),
+
+          // ★ 사이즈를 캡처하기 위해 LayoutBuilder 사용
           Expanded(
-            child: Container(
-              color: Colors.black,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  RepaintBoundary(
-                    child: CustomPaint(
-                      painter: _GridPainter(),
-                      child: const SizedBox.expand(),
-                    ),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final newSize = Size(constraints.maxWidth, constraints.maxHeight);
+                if (_canvasSize == null || _canvasSize != newSize) {
+                  _canvasSize = newSize;
+                  _sizeStamp++;
+                  // 사이즈 바뀌면 다음 프레임에 좌표 준비
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    _prepareCoordsIfNeeded();
+                  });
+                }
+
+                return Container(
+                  color: Colors.black,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      RepaintBoundary(
+                        child: CustomPaint(
+                          painter: const _GridPainter(),
+                          child: const SizedBox.expand(),
+                        ),
+                      ),
+                      RepaintBoundary(
+                        child: CustomPaint(
+                          // ★ 좌표만 넘겨서 그리기 — painter는 drawRawPoints 한 번만 호출
+                          painter: _PointsPainterPrecomputed(
+                            _coordsForDraw,
+                            _paintedVersion,
+                          ),
+                          child: const SizedBox.expand(),
+                        ),
+                      ),
+                    ],
                   ),
-                  RepaintBoundary(
-                    child: CustomPaint(
-                      painter: _PointsPainterRaw(_latest, _lut, _dataVersion),
-                      child: const SizedBox.expand(),
-                    ),
-                  ),
-                ],
-              ),
+                );
+              },
             ),
           ),
         ],
@@ -142,6 +249,12 @@ class _AngleLut {
     sinLut = Float32List(len);
     for (int i = 0; i < len; i++) {
       final deg = i * stepDeg;
+      if (deg >= 140 && deg <= 300) {
+        cosLut[i] = 0;
+        sinLut[i] = 0;
+        continue;
+      }
+
       final rad = deg * math.pi / 180.0;
       cosLut[i] = math.cos(rad);
       sinLut[i] = math.sin(rad);
@@ -219,71 +332,26 @@ class _GridPainter extends CustomPainter {
   bool shouldRepaint(covariant _GridPainter oldDelegate) => false;
 }
 
-/// 전경 포인트(원시 프레임으로 그리기)
-class _PointsPainterRaw extends CustomPainter {
-  final RplidarFrame? frame;
-  final _AngleLut lut;
-  final int version;
-  _PointsPainterRaw(this.frame, this.lut, this.version);
-
-  final _dir = List<double>.filled(2, 0.0, growable: false);
+/// 전경 포인트(미리 산출된 좌표만 그리기)
+class _PointsPainterPrecomputed extends CustomPainter {
+  final Float32List coordsForDraw; // 길이 j짜리 view
+  final int version;               // 그리기 버전(변경 시에만 repaint)
+  _PointsPainterPrecomputed(this.coordsForDraw, this.version);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final f = frame;
-    if (f == null || f.length == 0) return;
-
-    final center   = Offset(size.width / 2, size.height / 2);
-    final longest  = math.max(size.width, size.height);
-    final shortest = math.min(size.width, size.height);
-
-    // 0~1 m는 짧은 변 기준, 1~12 m는 긴 변 기준(모든 점을 표시할 필요 없음)
-    final double rOuter = longest  * 0.45; // 1..12 m
-    final double rInner = shortest * 0.45; // 0..1 m
-    const int innerMaxMm = 1000;
-    const int maxMm = 5000;
-
-    final n = f.length;
-    final coords = Float32List(n * 2);
-    int j = 0;
-
-    for (int i = 0; i < n; i++) {
-      final angle = f.angles[i];
-      final d     = f.dists[i].toInt();
-
-      // (선택) 각도 필터(필요시)
-      // if (angle >= 140 && angle <= 300) continue;
-
-      if (d <= 0 || d > maxMm) continue;
-
-      double r;
-      if (d <= innerMaxMm) {
-        final t0 = d / innerMaxMm;
-        r = t0 * rInner;
-      } else {
-        final t1 = (d - innerMaxMm) / (maxMm - innerMaxMm);
-        r = rInner + t1 * (rOuter - rInner);
-      }
-
-      // 방향 벡터
-      lut.dir(angle, _dir);
-      final x = center.dx + r * _dir[0];
-      final y = center.dy + r * _dir[1];
-
-      coords[j++] = x;
-      coords[j++] = y;
-    }
-
-    if (j == 0) return;
+    if (coordsForDraw.isEmpty) return;
 
     final dot = Paint()
       ..color = const Color(0xFF00FFAA)
       ..strokeWidth = 2
       ..isAntiAlias = false;
 
-    canvas.drawRawPoints(PointMode.points, coords.sublist(0, j), dot);
+    // 루프 없음 — 한 번에 그리기
+    canvas.drawRawPoints(PointMode.points, coordsForDraw, dot);
   }
 
   @override
-  bool shouldRepaint(covariant _PointsPainterRaw old) => old.version != version;
+  bool shouldRepaint(covariant _PointsPainterPrecomputed old) =>
+      !identical(old.coordsForDraw, coordsForDraw) || old.version != version;
 }
