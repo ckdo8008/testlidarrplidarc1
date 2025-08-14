@@ -17,7 +17,8 @@ class LidarPage extends StatefulWidget {
 
 class _LidarPageState extends State<LidarPage> {
   final lidar = RplidarC1();
-  StreamSubscription<RplidarPoint>? sub;
+  // StreamSubscription<RplidarPoint>? sub;
+  StreamSubscription<List<RplidarPoint>>? sub;
 
   /// 화면에 실제로 그릴 리스트(동일 인스턴스 유지; 내용만 교체)
   final points = <RplidarPoint>[];
@@ -33,12 +34,12 @@ class _LidarPageState extends State<LidarPage> {
   // 성능용: 각도 룩업테이블(0.5° 스텝)
   late final _AngleLut _lut = _AngleLut(0.5);
 
-  // 반경 매퍼(1~4 m 압축 비율)
-  static const _mapper = _RadiusMapper(
-    maxRangeMm: 4000,
+  // ── 그리드/스포크용 매퍼 (UI 스케일 데코 전용)
+  static const _gridMapper = _RadiusMapper(
+    maxRangeMm: 12000,  // ← 그리드는 12m 기준
     kneeStartMm: 1000,  // 1 m
     kneeEndMm: 4000,    // 4 m
-    innerFrac: 0.60,    // 1~4 m가 차지할 화면 반경 비율(원하면 0.80으로)
+    innerFrac: 0.60,
   );
 
   @override
@@ -52,15 +53,16 @@ class _LidarPageState extends State<LidarPage> {
   Future<void> _connect() async {
     await lidar.open();
     await lidar.getInfoAndHealth();
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('RPLIDAR 연결됨')),
     );
   }
 
   Future<void> _start() async {
-    final frames = <List<RplidarPoint>>[];
-    List<RplidarPoint> currentFrame = [];
-    bool seenStart = false;
+    // 최근 프레임 N개만 유지(오버레이) — N=1이면 최신 한 바퀴만 표시
+    const int maxFrames = 1;
+    final framesWindow = <List<RplidarPoint>>[];
 
     points.clear();
     _latestPoints = const [];
@@ -69,25 +71,29 @@ class _LidarPageState extends State<LidarPage> {
 
     await sub?.cancel();
 
-    // 스트림: 여기서는 setState 하지 않음 — 최신 데이터만 보관
-    sub = lidar.points.listen((p) {
-      if (p.startFlag) {
-        if (seenStart && currentFrame.isNotEmpty) {
-          frames.add(List<RplidarPoint>.from(currentFrame));
-          if (frames.length > 1) frames.removeAt(0); // 최근 1회전만 유지(원하면 N으로)
+    // 프레임 스트림 구독
+    sub = lidar.frames.listen((frame) {
+      // 필요 시 필터(예: 특정 각도 숨김). 없애고 전부 그리려면 주석 처리.
+      final filtered = frame.where((p) {
+        // 거리 필터는 painter에서도 처리하지만 여기선 가볍게 0mm만 제외
+        if (p.distanceMm <= 0) return false;
+        // 예시 각도 필터(140~300° 숨김) — 사용 안하려면 false 조건 제거
+        if (p.angleDeg >= 140 && p.angleDeg <= 300) return false;
+        return true;
+      }).toList(growable: false);
 
-          _latestPoints = frames.expand((f) => f).toList(growable: false);
-          _dataVersion++;
-          currentFrame.clear();
-        }
-        seenStart = true;
-      }
+      // 창에 누적(오버레이)
+      framesWindow.add(filtered);
+      if (framesWindow.length > maxFrames) framesWindow.removeAt(0);
 
-      if (p.angleDeg >= 140 && p.angleDeg <= 300) return;
-      currentFrame.add(p);
+      // 화면용 평탄화
+      _latestPoints = framesWindow.expand((f) => f).toList(growable: false);
+
+      // ★ 프레임이 비어 있어도 반드시 버전 증가 → 최초/빈 프레임도 리페인트
+      _dataVersion++;
     });
 
-    // 30fps 타이머: 데이터 버전 바뀌었을 때만 페인트
+    // 타이머: 버전 바뀌었을 때만 리페인트
     _repaintTimer?.cancel();
     _repaintTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (_dataVersion != _paintedVersion) {
@@ -108,7 +114,7 @@ class _LidarPageState extends State<LidarPage> {
     await lidar.stopScan();
     await sub?.cancel();
     _repaintTimer?.cancel();
-    setState(() => scanning = false);
+    if (mounted) setState(() => scanning = false);
   }
 
   @override
@@ -141,20 +147,21 @@ class _LidarPageState extends State<LidarPage> {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  /// 고정 레이어(그리드/스포크/라벨) — 거의 다시 그리지 않음
+                  /// 고정 레이어(그리드/스포크/라벨)
                   RepaintBoundary(
                     child: CustomPaint(
-                      painter: _GridPainter(_mapper),
+                      painter: _GridPainter(_gridMapper),
                       child: const SizedBox.expand(),
                     ),
                   ),
+
+                  /// 동적 레이어(포인트) — 15fps 타이머로만 갱신
                   RepaintBoundary(
                     child: CustomPaint(
-                      painter: _PointsPainter(points, _lut, _mapper,_dataVersion),
+                      painter: _PointsPainter(points, _lut, _dataVersion),
                       child: const SizedBox.expand(),
                     ),
                   ),
-                  /// 동적 레이어(포인트) — 30fps 타이머로만 갱신
                 ],
               ),
             ),
@@ -196,7 +203,7 @@ class _AngleLut {
 }
 
 /// ─────────────────────────────────────────────────────────────────────────
-/// 비선형 반경 매핑 (1~4m: innerFrac, 4~12m: 나머지)
+/// 비선형 반경 매핑 (그리드/스포크 데코용)
 class _RadiusMapper {
   final int maxRangeMm;   // 12000
   final int kneeStartMm;  // 1000 (1 m)
@@ -260,13 +267,11 @@ class _GridPainter extends CustomPainter {
     canvas.drawLine(Offset(center.dx, 0), Offset(center.dx, size.height), axis);
     canvas.drawLine(Offset(0, center.dy), Offset(size.width, center.dy), axis);
 
-    // // 반경 그리드(2 m 간격)
+    // 필요 시 반경 그리드(주석 유지)
     // for (int rMm = 2000; rMm <= mapper.maxRangeMm; rMm += 2000) {
     //   final rPx = mapper.mapMmToPx(rMm, totalR);
     //   final p = (rMm % 4000 == 0) ? gridBold : grid;
     //   canvas.drawCircle(center, rPx, p);
-    //
-    //   // 라벨(오른쪽)
     //   _drawLabel(canvas,
     //       offset: Offset(center.dx + rPx, center.dy),
     //       text: '${(rMm / 1000).toStringAsFixed(0)}m',
@@ -315,10 +320,9 @@ class _GridPainter extends CustomPainter {
 class _PointsPainter extends CustomPainter {
   final List<RplidarPoint> pts;
   final _AngleLut lut;
-  final _RadiusMapper mapper; // maxRangeMm만 사용
   final int version; // 데이터 버전으로 리페인트 트리거
 
-  _PointsPainter(this.pts, this.lut, this.mapper, this.version);
+  _PointsPainter(this.pts, this.lut, this.version);
 
   // 재사용 버퍼
   final _dir = List<double>.filled(2, 0.0, growable: false);
@@ -335,8 +339,8 @@ class _PointsPainter extends CustomPainter {
     final double rOuter = longest  * 0.45; // 1~12 m가 도달하는 바깥 반경(긴 변 기준)
     final double rInner = shortest * 0.45; // 0~1 m가 도달하는 내부 반경(짧은 변 기준)
 
-    const int innerMaxMm = 1000; // 1 m
-    final int maxMm = mapper.maxRangeMm; // 12000
+    const int innerMaxMm = 1000;   // 1 m
+    const int maxMm      = 5000;  // ★ 포인트는 항상 12 m 기준(짧은 변 비례 X)
 
     // 좌표를 한 번에 준비 → drawRawPoints 1회 호출
     final coords = Float32List(pts.length * 2);
@@ -346,10 +350,10 @@ class _PointsPainter extends CustomPainter {
       final d = p.distanceMm.toInt();
       if (d <= 0 || d > maxMm) continue;
 
-      // ★ 새로운 매핑: 0..1m -> 0..rInner, 1..12m -> rInner..rOuter
+      // 0..1m -> 0..rInner, 1..12m -> rInner..rOuter (긴 변 기준)
       double r;
       if (d <= innerMaxMm) {
-        final t0 = d / innerMaxMm;        // 0..1
+        final t0 = d / innerMaxMm;         // 0..1
         r = t0 * rInner;
       } else {
         final t1 = (d - innerMaxMm) / (maxMm - innerMaxMm); // 0..1
